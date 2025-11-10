@@ -1,0 +1,42 @@
+﻿import logging
+import logging.config
+import time
+
+# 尝试加载 logging.conf，否则回退到 basicConfig 写 crawler.log
+try:
+    logging.config.fileConfig('logging.conf', disable_existing_loggers=False)
+except Exception:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(threadName)s - %(message)s",
+        handlers=[
+            logging.FileHandler("crawler.log", encoding="utf-8"),
+            logging.StreamHandler()
+        ]
+    )
+
+logger = logging.getLogger(__name__)
+logger.info("=== 启动 test_run.py（将实例化 PostCrawler 并抓取 1 页） ===")
+
+from crawler import PostCrawler
+
+# small test: headless=True 更不易被系统窗口/焦点打断
+p = PostCrawler('000333', headless=True)
+p.crawl_post_info(1, 1)
+
+logger.info("=== test_run.py 完成 ===")
+
+# 尝试创建唯一索引（如果已存在或失败则捕获并记录，避免脚本崩溃）
+from pymongo import MongoClient
+try:
+    c = MongoClient("localhost", 27017)
+    db = c["post_info"]
+    # 尝试创建索引；若已存在或发生 DuplicateKeyError，会被捕获并记录
+    try:
+        db["post_000333"].create_index("post_url", unique=True, background=True)
+        print("index created or already exists")
+    except Exception as e:
+        # 这里不抛出异常，记录后继续；已在先前运行建立索引时可能产生 DuplicateKeyError
+        print("create_index warning (ignored):", e)
+except Exception as conn_e:
+    print("Mongo connection for index creation failed (ignored):", conn_e)

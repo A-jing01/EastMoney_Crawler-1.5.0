@@ -1,0 +1,54 @@
+name: quick_test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quick_test:
+    runs-on: ubuntu-latest
+    services:
+      mongo:
+        image: mongo:6.0
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd="mongo --eval 'db.adminCommand(\"ping\")'" --health-interval=10s --health-timeout=5s --health-retries=5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          # Install chromium for headless browser testing. webdriver-manager will download matching chromedriver.
+          sudo apt-get install -y chromium-browser
+
+      - name: Cache pip and webdriver-manager downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.wdm
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-py3.12
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run quick_test.py (headless, ephemeral)
+        env:
+          HEADLESS: '1'
+          MONGO_URI: 'mongodb://localhost:27017'
+          CHROME_BINARY_PATH: /usr/bin/chromium-browser
+        run: |
+          python ./quick_test.py --ephemeral

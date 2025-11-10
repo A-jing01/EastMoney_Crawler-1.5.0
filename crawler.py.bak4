@@ -1,0 +1,311 @@
+﻿"""
+crawler.py
+
+包含稳健的 WebDriver 管理与重连策略，以及 PostCrawler / CommentCrawler 的实现骨架。
+- 自动在可用时使用 webdriver-manager 下载 chromedriver，失败则回退到 CHROME_DRIVER_PATH 或 PATH.
+- 每个 driver 使用独立的临时 user-data-dir，避免 profile 冲突。
+- 对关键的浏览器操作使用重试装饰器：遇到可恢复错误时自动重启 driver 并重试（指数退避）。
+- 与仓库中的 parser.py、mongodb.py 协同工作。
+"""
+
+import os
+import time
+import random
+import tempfile
+import shutil
+import logging
+import traceback
+from typing import Tuple, Optional
+
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.common import exceptions as sel_ex
+
+# optional network libs
+try:
+    import urllib3
+    _has_urllib3 = True
+except Exception:
+    _has_urllib3 = False
+
+try:
+    import requests
+    _has_requests = True
+except Exception:
+    _has_requests = False
+
+# project modules
+from parser import PostParser, CommentParser
+from mongodb import MongoAPI
+
+logger = logging.getLogger(__name__)
+
+
+class WebDriverManager:
+    """创建/销毁 Chrome WebDriver，使用独立临时 profile，支持多种 driver 路径回退策略。"""
+
+    def __init__(self, headless: bool = False):
+        self.headless = headless
+        self.driver = None
+        self.user_data_dir = None
+        self.service = None
+
+    def _find_driver_path(self) -> Optional[str]:
+        # 尝试 webdriver-manager
+        try:
+            from webdriver_manager.chrome import ChromeDriverManager
+            path = ChromeDriverManager().install()
+            if path:
+                logger.info("[WebDriverManager] webdriver-manager chromedriver: %s", path)
+                return path
+        except Exception as e:
+            logger.debug("[WebDriverManager] webdriver-manager unavailable: %s", e)
+
+        # CHROME_DRIVER_PATH 环境变量优先
+        env_path = os.environ.get("CHROME_DRIVER_PATH")
+        if env_path and os.path.exists(env_path):
+            logger.info("[WebDriverManager] CHROME_DRIVER_PATH: %s", env_path)
+            return env_path
+
+        # PATH 回退
+        from shutil import which
+        path = which("chromedriver")
+        if path:
+            logger.info("[WebDriverManager] chromedriver in PATH: %s", path)
+            return path
+
+        return None
+
+    def create_driver(self) -> Tuple[webdriver.Chrome, str]:
+        driver_path = self._find_driver_path()
+        if not driver_path:
+            raise RuntimeError("无法找到 chromedriver。请设置 CHROME_DRIVER_PATH 或把 chromedriver 放入 PATH，或允许联网以使用 webdriver-manager。")
+
+        options = Options()
+        if self.headless or os.environ.get("HEADLESS") == "1":
+            options.add_argument("--headless=new")
+            options.add_argument("--disable-gpu")
+
+        # 稳定性选项
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+
+        # 指定 Chrome 可执行文件（可选）
+        chrome_bin = os.environ.get("CHROME_BINARY_PATH")
+        if chrome_bin:
+            options.binary_location = chrome_bin
+            logger.info("[WebDriverManager] Chrome binary: %s", chrome_bin)
+
+        # 使用独立临时 profile
+        self.user_data_dir = tempfile.mkdtemp(prefix="em_crawler_profile_")
+        options.add_argument(f"--user-data-dir={self.user_data_dir}")
+
+        # 随机 remote debugging 端口，降低冲突概率
+        port = random.randint(20000, 40000)
+        options.add_argument(f"--remote-debugging-port={port}")
+
+        # 启动 driver
+        self.service = Service(driver_path)
+        driver = webdriver.Chrome(service=self.service, options=options)
+
+        self.driver = driver
+        logger.info("[WebDriverManager] started chromedriver (port=%s, profile=%s)", port, self.user_data_dir)
+        return driver, self.user_data_dir
+
+    def quit_driver(self):
+        try:
+            if self.driver:
+                try:
+                    self.driver.quit()
+                except Exception as e:
+                    logger.debug("[WebDriverManager] driver.quit() error: %s", e)
+                self.driver = None
+        finally:
+            # 清理 temp profile
+            try:
+                if self.user_data_dir and os.path.exists(self.user_data_dir):
+                    shutil.rmtree(self.user_data_dir)
+            except Exception as e:
+                logger.debug("[WebDriverManager] remove profile error: %s", e)
+            self.user_data_dir = None
+            self.service = None
+            logger.info("[WebDriverManager] stopped chromedriver and cleaned profile.")
+
+
+def _is_recoverable_exception(exc: Exception) -> bool:
+    if isinstance(exc, sel_ex.WebDriverException):
+        return True
+    if isinstance(exc, OSError):
+        return True
+    if _has_requests and isinstance(exc, requests.exceptions.RequestException):
+        return True
+    if _has_urllib3 and isinstance(exc, urllib3.exceptions.ProtocolError):
+        return True
+    if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+        return True
+    return False
+
+
+def retry_on_driver_error(max_attempts=3, base_delay=2.0):
+    """
+    装饰器：对包含 webdriver 操作的方法进行重试。遇可恢复异常时调用对象的 _restart_driver()（若存在）。
+    """
+    def deco(func):
+        def wrapper(self, *args, **kwargs):
+            attempts = 0
+            last_exc = None
+            while attempts < max_attempts:
+                try:
+                    return func(self, *args, **kwargs)
+                except Exception as e:
+                    last_exc = e
+                    if _is_recoverable_exception(e):
+                        attempts += 1
+                        wait = base_delay * (2 ** (attempts - 1)) + random.random()
+                        logger.warning("[retry] attempt %d: recoverable %s, wait %.1fs then restart driver", attempts, type(e).__name__, wait)
+                        logger.debug(traceback.format_exc())
+                        try:
+                            restart = getattr(self, "_restart_driver", None)
+                            if callable(restart):
+                                try:
+                                    restart()
+                                except Exception as re:
+                                    logger.debug("[retry] _restart_driver() error: %s", re)
+                        except Exception:
+                            pass
+                        time.sleep(wait)
+                        continue
+                    else:
+                        logger.error("[retry] unrecoverable error: %s", e)
+                        raise
+            logger.error("[retry] exceeded max attempts (%d), last error: %s", max_attempts, last_exc)
+            raise last_exc
+        return wrapper
+    return deco
+
+
+class PostCrawler:
+    """帖子爬虫：使用 WebDriverManager 管理浏览器，解析后批量写入 Mongo。"""
+
+    def __init__(self, symbol: str, headless: bool = False):
+        self.symbol = symbol
+        self.headless = headless
+        self.wdm = WebDriverManager(headless=headless)
+        self.driver, self.profile = self.wdm.create_driver()
+        self.parser = PostParser()
+        self.mongo = MongoAPI("post_info", f"post_{symbol}")
+        self._page_sleep = 0.5
+
+    def _restart_driver(self):
+        logger.warning("[PostCrawler %s] restarting WebDriver ...", self.symbol)
+        try:
+            self.wdm.quit_driver()
+        except Exception as e:
+            logger.debug("[PostCrawler %s] quit_driver error: %s", self.symbol, e)
+        time.sleep(1 + random.random())
+        self.driver, self.profile = self.wdm.create_driver()
+        logger.info("[PostCrawler %s] WebDriver restarted.", self.symbol)
+
+    @retry_on_driver_error(max_attempts=4, base_delay=2.0)
+    def _fetch_list_page(self, page_num: int):
+        list_url = f"https://guba.eastmoney.com/list,{self.symbol},{page_num}.html"
+        logger.info("[PostCrawler %s] open list page: %s", self.symbol, list_url)
+        self.driver.get(list_url)
+        time.sleep(self._page_sleep)
+        posts = self.driver.find_elements("css selector", "div.table_list tr")
+        return posts
+
+    def _parse_and_store(self, elements):
+        if not elements:
+            return 0
+        docs = []
+        for el in elements:
+            try:
+                doc = self.parser.parse_post_info(el)
+                docs.append(doc)
+            except Exception as e:
+                logger.debug("[PostCrawler %s] parse item error: %s", self.symbol, e)
+        if docs:
+            res_ids = self.mongo.insert_many(docs)
+            inserted = len(res_ids) if res_ids else 0
+            logger.info("[PostCrawler %s] batch wrote %d (inserted %d)", self.symbol, len(docs), inserted)
+            return inserted
+        return 0
+
+    def crawl_post_info(self, start_page: int = 1, end_page: int = 1):
+        logger.info("[PostCrawler %s] crawling pages %d -> %d", self.symbol, start_page, end_page)
+        for p in range(start_page, end_page + 1):
+            try:
+                elements = self._fetch_list_page(p)
+                self._parse_and_store(elements)
+            except Exception as e:
+                logger.error("[PostCrawler %s] page %d error: %s", self.symbol, p, e)
+                logger.debug(traceback.format_exc())
+                time.sleep(2 + random.random())
+                continue
+        logger.info("[PostCrawler %s] crawl finished.", self.symbol)
+        try:
+            self.wdm.quit_driver()
+        except Exception:
+            pass
+
+
+class CommentCrawler:
+    """评论爬虫骨架，逻辑与 PostCrawler 类似。"""
+
+    def __init__(self, symbol: str, headless: bool = False):
+        self.symbol = symbol
+        self.headless = headless
+        self.wdm = WebDriverManager(headless=headless)
+        self.driver, self.profile = self.wdm.create_driver()
+        self.parser = CommentParser()
+        self.mongo = MongoAPI("comment_info", f"comment_{symbol}")
+
+    def _restart_driver(self):
+        logger.warning("[CommentCrawler %s] restarting WebDriver ...", self.symbol)
+        try:
+            self.wdm.quit_driver()
+        except Exception as e:
+            logger.debug("[CommentCrawler] quit_driver error: %s", e)
+        time.sleep(1 + random.random())
+        self.driver, self.profile = self.wdm.create_driver()
+        logger.info("[CommentCrawler %s] WebDriver restarted.", self.symbol)
+
+    @retry_on_driver_error(max_attempts=4, base_delay=2.0)
+    def _open_post_and_get_reply_elements(self, post_url: str):
+        logger.info("[CommentCrawler %s] open post: %s", self.symbol, post_url)
+        self.driver.get(post_url)
+        time.sleep(0.8 + random.random() * 0.5)
+        comments = self.driver.find_elements("css selector", "div.replyList")
+        return comments
+
+    def crawl_comment_info(self, post_url_list):
+        logger.info("[CommentCrawler %s] crawl %d posts", self.symbol, len(post_url_list))
+        for url in post_url_list:
+            try:
+                els = self._open_post_and_get_reply_elements(url)
+                docs = []
+                for el in els:
+                    try:
+                        doc = self.parser.parse_comment_info(el, post_id=url, sub_bool=False)
+                        docs.append(doc)
+                    except Exception as e:
+                        logger.debug("[CommentCrawler %s] single comment parse error: %s", self.symbol, e)
+                if docs:
+                    res = self.mongo.insert_many(docs)
+                    inserted = len(res) if res else 0
+                    logger.info("[CommentCrawler %s] inserted %d comments (success %d)", self.symbol, len(docs), inserted)
+            except Exception as e:
+                logger.error("[CommentCrawler %s] post %s error: %s", self.symbol, url, e)
+                logger.debug(traceback.format_exc())
+                time.sleep(2 + random.random())
+                continue
+        try:
+            self.wdm.quit_driver()
+        except Exception:
+            pass
