@@ -36,7 +36,10 @@ def create_webdriver():
     options = Options()
     # 可选无头模式
     if os.environ.get("HEADLESS", "") == "1":
+        # Use new headless mode and expose a remote debugging port to avoid
+        # DevToolsActivePort startup race issues on some runners.
         options.add_argument("--headless=new")
+        options.add_argument("--remote-debugging-port=9222")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
