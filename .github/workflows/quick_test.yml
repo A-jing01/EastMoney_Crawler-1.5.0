@@ -9,11 +9,14 @@ jobs:
     runs-on: ubuntu-latest
     services:
       mongo:
-        image: mongo:6.0
+        # Use a Mongo image version that works with the Actions runner healthcheck.
+        # mongo:6.0 sometimes fails the default health-cmd (mongo shell availability). Use 5.0 for CI stability.
+        image: mongo:5.0
         ports:
           - 27017:27017
+        # Keep a reasonable healthcheck but give more retries/time to stabilize in the CI environment.
         options: >-
-          --health-cmd="mongo --eval 'db.adminCommand(\"ping\")'" --health-interval=10s --health-timeout=5s --health-retries=5
+          --health-cmd="mongo --eval 'db.adminCommand(\"ping\")'" --health-interval=10s --health-timeout=10s --health-retries=10
 
     steps:
       - name: Checkout
